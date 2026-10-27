@@ -1,0 +1,97 @@
+name: OCI ARM Retry
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oci-retry           # 同一组只允许 1 个 job 在跑，新的排队（1 running + 1 waiting）
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # GitHub 单个 job 上限 6 小时，留 25 分钟给前置步骤
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OCI SDK
+        run: pip install --quiet --disable-pip-version-check oci
+
+      - name: Write OCI credentials
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf "%s" "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          echo >> ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY"
+            echo "region=$OCI_REGION"
+            echo "key_file=$HOME/.oci/oci_api_key.pem"
+          } > ~/.oci/config
+
+      - name: Retry loop
+        id: retry
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: "1"      # 不缓冲，日志实时可见
+        run: |
+          set +e
+          timeout 19800 python oci_retry.py
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "::notice::oci_retry.py 退出码 = $rc （0=抢到 / 124=超时 / 其它=致命错误）"
+
+      - name: 抢到了 → 停用本 workflow
+        if: steps.retry.outputs.rc == '0'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          curl -sS -f -X PUT \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/oci_retry.yml/disable"
+          echo "workflow 已停用，不用再手动操作"
+
+      - name: 没抢到 → 立刻接力下一个 job
+        if: steps.retry.outputs.rc == '124'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -e
+          curl -sS -f -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/oci_retry.yml/dispatches" \
+            -d "{\"ref\":\"$REF\"}"
+          echo "下一个 job 已排队"
+
+      - name: 致命错误 → 停链并报警
+        if: steps.retry.outputs.rc != '0' && steps.retry.outputs.rc != '124'
+        env:
+          RC: ${{ steps.retry.outputs.rc }}
+        run: |
+          echo "::error::退出码 $RC —— 重试没有意义，链条已停止。看上面日志里的 FATAL 行。"
+          exit 1
