@@ -164,6 +164,43 @@ def apply_ingress(network, vcn):
     print("ingress = tcp/" + ", tcp/".join(str(p) for p in sorted(wanted)) + "  (0.0.0.0/0)")
 
 
+def ensure_igw(network, vcn):
+    for gw in network.list_internet_gateways(COMPARTMENT_ID, vcn_id=vcn.id).data:
+        if gw.lifecycle_state == "AVAILABLE":
+            print("IGW     = 复用 " + str(gw.id))
+            return gw
+    gw = network.create_internet_gateway(
+        oci.core.models.CreateInternetGatewayDetails(
+            compartment_id=COMPARTMENT_ID,
+            vcn_id=vcn.id,
+            display_name=VCN_NAME + "-ig",
+            is_enabled=True,
+        )
+    ).data
+    print("IGW     = 新建 " + str(gw.id))
+    return gw
+
+
+def ensure_route(network, vcn, igw):
+    table = network.get_route_table(vcn.default_route_table_id).data
+    rules = list(table.route_rules or [])
+    for rule in rules:
+        if str(getattr(rule, "destination", "")) == "0.0.0.0/0":
+            print("route   = 已有默认路由")
+            return
+    rules.append(
+        oci.core.models.RouteRule(
+            destination="0.0.0.0/0",
+            network_entity_id=igw.id,
+        )
+    )
+    network.update_route_table(
+        vcn.default_route_table_id,
+        oci.core.models.UpdateRouteTableDetails(route_rules=rules),
+    )
+    print("route   = 已添加默认路由")
+
+
 def ensure_network(cfg):
     network = oci.core.VirtualNetworkClient(cfg)
     vcns = network.list_vcns(COMPARTMENT_ID, display_name=VCN_NAME).data
@@ -179,26 +216,9 @@ def ensure_network(cfg):
             )
         ).data
         print("VCN     = 新建 " + str(vcn.id))
-        ig = network.create_internet_gateway(
-            oci.core.models.CreateInternetGatewayDetails(
-                compartment_id=COMPARTMENT_ID,
-                vcn_id=vcn.id,
-                display_name=VCN_NAME + "-ig",
-                is_enabled=True,
-            )
-        ).data
-        network.update_route_table(
-            vcn.default_route_table_id,
-            oci.core.models.UpdateRouteTableDetails(
-                route_rules=[
-                    oci.core.models.RouteRule(
-                        destination="0.0.0.0/0",
-                        network_entity_id=ig.id,
-                    )
-                ]
-            ),
-        )
-        print("IGW     = 新建 " + str(ig.id))
+    # 网关和默认路由也要幂等：VCN 已存在但上次没建完时，这里必须补上，否则实例没有外网
+    igw = ensure_igw(network, vcn)
+    ensure_route(network, vcn, igw)
     # 关键：不管 VCN 是新建还是复用，这里都执行（原版只在新建分支里设置端口，复用就永远开不出端口）
     apply_ingress(network, vcn)
     subnets = network.list_subnets(COMPARTMENT_ID, vcn_id=vcn.id, display_name=SUBNET_NAME).data
@@ -275,6 +295,28 @@ def report_success(cfg, inst):
     print("=" * 70)
 
 
+def prepare(cfg, shape):
+    """准备阶段（建网络、取 AD、取镜像）失败时重试，不要因为一次 API 抖动就整条链崩掉。"""
+    last = None
+    for attempt in range(1, 11):
+        try:
+            subnet_id = ensure_network(cfg)
+            ads = list_ads(cfg)
+            print("ADs     = " + " | ".join(ads))
+            if len(ads) == 1:
+                print("          （本区只有 1 个 AD，换 AD 这条路走不通，只能靠持续重试）")
+            image_id = find_image(cfg, shape)
+            return subnet_id, ads, image_id
+        except oci.exceptions.ServiceError as exc:
+            last = exc
+            print("准备阶段失败（第 " + str(attempt) + " 次）：" + str(getattr(exc, "code", "")) + " " + str(getattr(exc, "message", ""))[:130])
+        except Exception as exc:
+            last = exc
+            print("准备阶段失败（第 " + str(attempt) + " 次）：" + type(exc).__name__ + " " + str(exc)[:130])
+        time.sleep(15)
+    die("准备阶段连续失败 10 次，最后一次：" + str(last)[:200])
+
+
 def retry(shape, specs, boot_gb, instance_name):
     print("shape   = " + shape)
     if specs:
@@ -285,12 +327,7 @@ def retry(shape, specs, boot_gb, instance_name):
     print("ports   = " + ",".join(str(p) for p in INGRESS_PORTS))
     print("")
     cfg = load_config()
-    subnet_id = ensure_network(cfg)
-    ads = list_ads(cfg)
-    print("ADs     = " + " | ".join(ads))
-    if len(ads) == 1:
-        print("          （本区只有 1 个 AD，换 AD 这条路走不通，只能靠持续重试）")
-    image_id = find_image(cfg, shape)
+    subnet_id, ads, image_id = prepare(cfg, shape)
     print("")
     attempt = 0
     started = time.time()

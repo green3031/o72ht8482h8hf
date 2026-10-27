@@ -14,6 +14,13 @@ jobs:
   retry:
     runs-on: ubuntu-latest
     timeout-minutes: 355        # GitHub 单个 job 上限 6 小时，留 25 分钟给前置步骤
+    # 放在 job 级：step 级 env 不会传给后续 step，而 Python 脚本要从环境变量读 OCI_TENANCY
+    env:
+      OCI_USER: ${{ secrets.OCI_USER }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,12 +34,6 @@ jobs:
         run: pip install --quiet --disable-pip-version-check oci
 
       - name: Write OCI credentials
-        env:
-          OCI_USER: ${{ secrets.OCI_USER }}
-          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
-          OCI_REGION: ${{ secrets.OCI_REGION }}
-          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
         run: |
           mkdir -p ~/.oci
           printf "%s" "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
